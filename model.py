@@ -122,24 +122,39 @@ class _ColumnParallelLinearFn(torch.autograd.Function):
         y = linear(x, weight, bias)
         ctx.save_for_backward(x, weight, bias)
         ctx.all_gather = all_gather
+        if all_gather:
+            gathered = dist_nnF.all_gather(y)
+            y = torch.cat(gathered, dim=-1)
         return y
 
     @staticmethod
     def backward(ctx, dout):
         # x.shape: [bs, seqlen, in_features]
         # weight.shape: [out_features / TP, in_features]
-        # dout.shape: [bs, seqlen, out_features / TP]
+        # dout.shape: [bs, seqlen, out_features] if all_gather=True, else [bs, seqlen, out_features / TP]
         x, weight, bias = ctx.saved_tensors
-        all_gather = ctx.all_gather
+
+        if ctx.all_gather and world_size > 1:
+            # dout is [bs, seqlen, out_features], we need to extract our local shard
+            # Each rank is responsible for out_features/TP outputs
+            shard_size = dout.size(-1) // world_size
+            start_idx = rank * shard_size
+            end_idx = (rank + 1) * shard_size
+            local_dout = dout[..., start_idx:end_idx]
+        else:
+            local_dout = dout
 
         # [bs, seqlen, out_features / TP] @ [out_features / TP, in_features] -> [bs, seqlen, in_features]
-        dx = linear(dout, weight.T)
+        dx = linear(local_dout, weight.T)
         # This dx is local, so we do an all_reduce to get global dx
         if world_size > 1 and dist.is_initialized():
             dist.all_reduce(dx, op=dist.ReduceOp.SUM)
 
-        x_flat = x.view(-1, x.size(-1))  # [bs * seqlen, in_features]
-        dout_flat = dout.view(-1, dout.size(-1))  # [bs * seqlen, out_features / TP]
+        # TODO: should we cast to FP32 for numerical stability ?
+        x_flat = x.view(-1, x.size(-1)).to(torch.float32)  # [bs * seqlen, in_features]
+        dout_flat = local_dout.view(-1, local_dout.size(-1)).to(
+            torch.float32
+        )  # [bs * seqlen, out_features / TP]
 
         # [bs * seqlen, out_features / TP].T @ [bs * seqlen, in_features] -> [out_features / TP, in_features]
         dw = dout_flat.T @ x_flat
@@ -173,13 +188,8 @@ class ColumnParallelLinear(Linear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # print(f"Column forward: {x.shape, self.weight.shape}")
         # [bs, in_features] @ [out_features / TP, in_features].T -> [bs, out_features / TP]
-        y = _ColumnParallelLinearFn.apply(x, self.weight, self.bias, self.all_gather)
-        if world_size == 1 or not dist.is_initialized():
-            return y
-        if self.all_gather:
-            y = dist_nnF.all_gather(y)
-            y = torch.cat(y, dim=-1)
-        return y
+        # or [bs, out_features] if all_gather=True
+        return _ColumnParallelLinearFn.apply(x, self.weight, self.bias, self.all_gather)
 
 
 class RowParallelLinear(Linear):
@@ -452,5 +462,5 @@ def test_attention():
 # test_moe()
 # test_gate()
 # test_attention()
-test_column_parallel_linear()
+
 dist.destroy_process_group()
