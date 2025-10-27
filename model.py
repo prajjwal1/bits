@@ -5,22 +5,30 @@ from typing import Literal, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nnF
 import torch.nn.functional as F
 from torch import nn
 
 
-def init_process_group():
-    if dist.is_available() and "RANK" in os.environ:
-        dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
+def init_distributed():
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    if world_size > 1:
+        local_rank = int(
+            os.environ.get("LOCAL_RANK", str(rank % max(1, torch.cuda.device_count())))
+        )
+        torch.cuda.set_device(local_rank)
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     else:
-        rank = 0
-        world_size = 1
-    return rank, world_size
+        local_rank = 0
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+    return rank, world_size, local_rank
 
 
-rank, world_size = init_process_group()
+rank, world_size, local_rank = init_distributed()
 
 
 @dataclass
@@ -63,48 +71,132 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return y.to(dtype)
 
 
+def linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    scale_fmt: Optional[str] = None,
+) -> torch.Tensor:
+    # TODO: only supports BF16 linear
+    return F.linear(x, weight, bias)
+
+
+class Linear(nn.Module):
+    dtype = torch.bfloat16
+    scale_fmt: Optional[str] = None
+
+    def __init__(
+        self, in_features: int, out_features: int, bias: bool = False, dtype=None
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        device = f"cuda:{torch.cuda.current_device()}"
+        self.weight = nn.Parameter(
+            torch.empty(
+                out_features,
+                in_features,
+                dtype=dtype or Linear.dtype,
+                device=device,
+            )
+        )
+        self.world_size = world_size
+        # Currently does not support FP8
+        self.register_parameter("scale", None)
+        if bias:
+            self.bias = nn.Parameter(
+                torch.empty(out_features, dtype=dtype or Linear.dtype, device=device)
+            )
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return linear(x, self.weight, self.bias, self.scale_fmt)
+
+
 class _ColumnParallelLinearFn(torch.autograd.Function):
     @staticmethod
-    def forward(self, x: torch.Tensor, weight: torch.Tensor, bias) -> torch.Tensor:
-        y = x @ weight
-        if bias is not None:
-            y = y + bias
+    def forward(
+        ctx, x: torch.Tensor, weight: torch.Tensor, bias, all_gather
+    ) -> torch.Tensor:
+        y = linear(x, weight, bias)
         ctx.save_for_backward(x, weight, bias)
+        ctx.all_gather = all_gather
         return y
-    
+
+    @staticmethod
     def backward(ctx, dout):
-        # dx = g @ w.T
-        # dw = x.T @ g
-        # dout.shape: [B, out_features // TP]
-        x, weight, bias = ctx.saved_tensors        
-        # [B, out_features // TP] @ [out_features // TP, in_features] -> [B, in_features]
-        dx = dout @ weight.T 
-        dist.all_reduce(dx, op=dist.ReduceOp.SUM)
+        # x.shape: [bs, seqlen, in_features]
+        # weight.shape: [out_features / TP, in_features]
+        # dout.shape: [bs, seqlen, out_features / TP]
+        x, weight, bias = ctx.saved_tensors
+        all_gather = ctx.all_gather
 
-        x = ctx.input_tensor
-        # [in_features, B] @ [B, out_features] -> [in_features, out_features]
-        dw = x.T @ dout
-        dbias = dout.sum(dim=0) if self.bias is not None else None
-        return dx, dw, db
+        # [bs, seqlen, out_features / TP] @ [out_features / TP, in_features] -> [bs, seqlen, in_features]
+        dx = linear(dout, weight.T)
+        # This dx is local, so we do an all_reduce to get global dx
+        if world_size > 1 and dist.is_initialized():
+            dist.all_reduce(dx, op=dist.ReduceOp.SUM)
 
-class ColumnParallelLinear(nn.Module):
-    def __init__(self, in_features, out_features, bias=False, dtype=None):
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(in_features // world_size))
+        x_flat = x.view(-1, x.size(-1))  # [bs * seqlen, in_features]
+        dout_flat = dout.view(-1, dout.size(-1))  # [bs * seqlen, out_features / TP]
+
+        # [bs * seqlen, out_features / TP].T @ [bs * seqlen, in_features] -> [out_features / TP, in_features]
+        dw = dout_flat.T @ x_flat
+        # This dw is local, for global view, need to perform all_gather on dim=-1
+
+        db = dout_flat.sum(dim=0) if bias is not None else None
+        return dx, dw, db, None
+
+
+class ColumnParallelLinear(Linear):
+    """
+    Shards the output dimensions (or columns) of weight matrix across TP ranks
+    Y = X.W^T + b
+        X: [batch, in_features]
+        W: [out_features, in_features]
+        b: [batch, out_features]
+    Shards W along its first dimension -> out_features
+    Each rank holds [out_features / TP, in_features]
+
+    Megatron doesn't do all_gather in the forward
+    """
+
+    def __init__(
+        self, in_features, out_features, bias=False, dtype=None, all_gather=False
+    ):
+        assert out_features % world_size == 0
+        self.part_out_features = out_features // world_size
+        super().__init__(in_features, self.part_out_features, bias, dtype)
+        self.all_gather = all_gather
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # print(f"Column forward: {x.shape, self.weight.shape}")
+        # [bs, in_features] @ [out_features / TP, in_features].T -> [bs, out_features / TP]
+        y = _ColumnParallelLinearFn.apply(x, self.weight, self.bias, self.all_gather)
+        if world_size == 1 or not dist.is_initialized():
+            return y
+        if self.all_gather:
+            y = dist_nnF.all_gather(y)
+            y = torch.cat(y, dim=-1)
+        return y
+
 
 class RowParallelLinear(Linear):
     def __init__(
         self, in_features: int, out_features: int, bias: bool = False, dtype=None
     ):
-        super().__init__(in_features // world_size, out_features, bias)
+        assert in_features % world_size == 0
+        self.part_in_features = in_features // world_size
+        super().__init__(self.part_in_features, out_features, bias, dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # y = x @ w, we need all reduce here
-        y = linear(x, self.weight, self.bias)
+        # x.shape: [bs, seqlen, dim]
+        # weight.shape: [dim, dim // TP]
+        y = linear(x, self.weight.T, self.bias)
         if world_size > 1:
             dist.all_reduce(y)
-        if self.bias is not None:
-            y += self.bias
         return y
 
 
@@ -149,6 +241,7 @@ class MLA(nn.Module):
                 args.max_seq_len,
                 self.n_local_heads,
                 self.qk_head_dim,
+                dtype=torch.bfloat16,
             ),
             persistent=False,
         )
@@ -159,6 +252,7 @@ class MLA(nn.Module):
                 args.max_seq_len,
                 self.n_local_heads,
                 self.v_head_dim,
+                dtype=torch.bfloat16,
             ),
             persistent=False,
         )
@@ -344,7 +438,7 @@ def test_attention():
     args = ModelArgs()
     device = "cuda"
     attention = MLA(args).to(device)
-    x = torch.rand(8, 512, args.dim, device=device)
+    x = torch.rand(8, 512, args.dim, device=device, dtype=torch.bfloat16)
     freqs_cis = precompute_freqs_cis(args)
     start_pos = 0
     seqlen = x.size(1)
@@ -357,5 +451,6 @@ def test_attention():
 
 # test_moe()
 # test_gate()
-test_attention()
+# test_attention()
+test_column_parallel_linear()
 dist.destroy_process_group()
