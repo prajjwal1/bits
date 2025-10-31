@@ -1,6 +1,13 @@
+# usage: torchrun --nproc_per_node 8 test_linear.py
+
 import torch
 
-from model import ColumnParallelLinear, init_distributed, Linear
+from model import (
+    ColumnParallelLinear,
+    init_distributed,
+    Linear,
+    RowParallelLinear
+)
 
 rank, world_size, local_rank = init_distributed()
 
@@ -99,7 +106,60 @@ def test_column_parallel_linear():
     assert torch.allclose(column_linear2.weight.grad, ref_wg2)
     assert torch.allclose(column_linear2.bias.grad, ref_bg2)
 
-    print("Test Linear passed")
+    print("Column Parallel Linear passed")
 
 
-test_column_parallel_linear()
+def test_row_parallel_linear():
+    batch_size, seqlen = 4, 512
+    in_features, out_features = 128, 256
+    bias = True
+    device = "cuda"
+    dtype = torch.bfloat16
+    x = torch.rand(
+        batch_size,
+        seqlen,
+        in_features,
+        dtype=torch.bfloat16,
+        device=device,
+        requires_grad=True,
+    )
+    reference_linear = Linear(in_features, out_features, bias=bias, dtype=dtype).to(
+        device
+    )
+    row_linear = RowParallelLinear(
+        in_features, out_features, bias=bias, dtype=dtype
+    ).to(device)
+
+    shard = in_features // world_size
+    start, end = rank * shard, (rank + 1) * shard
+
+    # Copy the reference weights to the row parallel linear
+    row_linear.weight.data = reference_linear.weight.data[:, start:end].clone()
+    # we do not shard the bias
+
+    # Forward
+    ref_out = reference_linear(x)
+    # [4, 512, 128] @ [256 / TP, 128].T -> [4, 512, 256]  # all_gather = True
+    sharded_x = x[:, :, start: end]
+    out = row_linear(sharded_x)
+
+    assert out.shape == torch.Size(
+        [batch_size, seqlen, out_features]
+    ), f"out.shape: {out.shape} ref_out.shape: {ref_out.shape}"
+    assert torch.allclose(ref_out, out), (ref_out - out).abs().max().item()
+
+    # backward
+    ref_out.sum().backward()
+    ref_wg, ref_bg = (
+        reference_linear.weight.grad[:, start:end].detach().clone(),
+        reference_linear.bias.grad.detach().clone(),
+    )
+    out.sum().backward()
+    assert torch.allclose(row_linear.weight.grad, ref_wg)
+    assert torch.allclose(row_linear.bias.grad, ref_bg)
+
+    print("Row Parallel Linear Test passed")
+
+
+# test_column_parallel_linear()
+test_row_parallel_linear()

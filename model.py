@@ -186,13 +186,48 @@ class ColumnParallelLinear(Linear):
         self.all_gather = all_gather
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # print(f"Column forward: {x.shape, self.weight.shape}")
         # [bs, in_features] @ [out_features / TP, in_features].T -> [bs, out_features / TP]
         # or [bs, out_features] if all_gather=True
         return _ColumnParallelLinearFn.apply(x, self.weight, self.bias, self.all_gather)
 
 
+class _RowParallelLinearFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, bias=False):
+        # [batch, in_features / TP] @ [out_features, in_features / TP].T -> [bs, out_features]
+        y = linear(x, weight, bias)
+        dist.all_reduce(y)
+        ctx.save_for_backward(x, weight, bias)
+        return y
+
+    @staticmethod
+    def backward(ctx, dout):
+        # dout.shape -> [bs, seqlen, out_features]
+        # x.shape -> [bs, seqlen, in_features // TP]  (in forward, we save the sharded input)
+        # dw.shape -> [out_features, in_features // TP]
+
+        x, weight, bias = ctx.saved_tensors
+
+        # [bs * seqlen, out_features].T @ [bs * seqlen, in_features // TP] -> [out_features, in_features // TP]
+        x_flat = x.view(-1, x.size(-1)).to(torch.float32)
+        dout_flat = dout.view(-1, dout.size(-1)).to(torch.float32)
+        dw = dout_flat.T @ x_flat
+        # [bs, seqlen, out_features] @ [out_features, in_features // TP] -> [bs, seqlen, in_features // TP]
+        dx = dout @ weight
+
+        db = dout_flat.sum(dim=0)
+        return dx, dw, db
+
+
 class RowParallelLinear(Linear):
+    """
+    Shards the input dimensions (or rows) of weight matrix across TP ranks
+    Y = X.W^T + b
+    X: [batch, in_features / TP]
+    W: [out_features, in_features / TP]
+    b: [batch, out_features]
+    """
+
     def __init__(
         self, in_features: int, out_features: int, bias: bool = False, dtype=None
     ):
@@ -204,10 +239,7 @@ class RowParallelLinear(Linear):
         # y = x @ w, we need all reduce here
         # x.shape: [bs, seqlen, dim]
         # weight.shape: [dim, dim // TP]
-        y = linear(x, self.weight.T, self.bias)
-        if world_size > 1:
-            dist.all_reduce(y)
-        return y
+        return _RowParallelLinearFn.apply(x, self.weight, self.bias)
 
 
 class MLA(nn.Module):
