@@ -1,4 +1,5 @@
 # Reference: https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
+import math
 import os
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
@@ -8,6 +9,54 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nnF
 import torch.nn.functional as F
 from torch import nn
+
+# for deterministic init
+torch.manual_seed(0)
+torch.cuda.manual_seed_all(0)
+
+
+@dataclass
+class ParallelismConfig:
+    tensor_parallel_size: int = 1
+    data_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+    expert_parallel_size: int = 1
+    context_parallel_size: int = 1
+
+    def __post_init__(self):
+        world_size: int = (
+            self.tensor_parallel_size
+            * self.data_parallel_size
+            * self.pipeline_parallel_size
+            * self.context_parallel_size
+        )
+
+
+@dataclass
+class ParallelismGroups:
+    tp_group: Optional[dist.ProcessGroup] = None
+    tp_rank: int = 0
+    tp_size: int = 1
+
+    dp_group: Optional[dist.ProcessGroup] = None
+    dp_rank: int = 0
+    dp_size: int = 1
+
+    pp_group: Optional[dist.ProcessGroup] = None
+    pp_rank: int = 0
+    pp_size: int = 1
+
+    cp_group: Optional[dist.ProcessGroup] = None
+    cp_rank: int = 0
+    cp_size: int = 1
+
+    ep_group: Optional[dist.ProcessGroup] = None
+    ep_rank: int = 0
+    ep_size: int = 1
+
+    global_rank: int = 0
+    global_size: int = 1
+    local_rank: int = 0
 
 
 def init_distributed():
@@ -109,6 +158,14 @@ class Linear(nn.Module):
             )
         else:
             self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return linear(x, self.weight, self.bias, self.scale_fmt)
@@ -120,8 +177,9 @@ class _ColumnParallelLinearFn(torch.autograd.Function):
         ctx, x: torch.Tensor, weight: torch.Tensor, bias, all_gather
     ) -> torch.Tensor:
         y = linear(x, weight, bias)
-        ctx.save_for_backward(x, weight, bias)
+        ctx.save_for_backward(x, weight)
         ctx.all_gather = all_gather
+        ctx.has_bias = bias is not None
         if all_gather:
             gathered = dist_nnF.all_gather(y)
             y = torch.cat(gathered, dim=-1)
@@ -132,7 +190,7 @@ class _ColumnParallelLinearFn(torch.autograd.Function):
         # x.shape: [bs, seqlen, in_features]
         # weight.shape: [out_features / TP, in_features]
         # dout.shape: [bs, seqlen, out_features] if all_gather=True, else [bs, seqlen, out_features / TP]
-        x, weight, bias = ctx.saved_tensors
+        x, weight = ctx.saved_tensors
 
         if ctx.all_gather and world_size > 1:
             # dout is [bs, seqlen, out_features], we need to extract our local shard
@@ -160,7 +218,7 @@ class _ColumnParallelLinearFn(torch.autograd.Function):
         dw = dout_flat.T @ x_flat
         # This dw is local, for global view, need to perform all_gather on dim=-1
 
-        db = dout_flat.sum(dim=0) if bias is not None else None
+        db = dout_flat.sum(dim=0) if ctx.has_bias else None
         return dx, dw, db, None
 
 
@@ -196,8 +254,10 @@ class _RowParallelLinearFn(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, bias=False):
         # [batch, in_features / TP] @ [out_features, in_features / TP].T -> [bs, out_features]
         y = linear(x, weight, bias)
-        dist.all_reduce(y)
-        ctx.save_for_backward(x, weight, bias)
+        if world_size > 1:
+            dist.all_reduce(y)
+        ctx.save_for_backward(x, weight)
+        ctx.has_bias = bias is not None
         return y
 
     @staticmethod
@@ -206,7 +266,7 @@ class _RowParallelLinearFn(torch.autograd.Function):
         # x.shape -> [bs, seqlen, in_features // TP]  (in forward, we save the sharded input)
         # dw.shape -> [out_features, in_features // TP]
 
-        x, weight, bias = ctx.saved_tensors
+        x, weight = ctx.saved_tensors
 
         # [bs * seqlen, out_features].T @ [bs * seqlen, in_features // TP] -> [out_features, in_features // TP]
         x_flat = x.view(-1, x.size(-1)).to(torch.float32)
@@ -215,7 +275,7 @@ class _RowParallelLinearFn(torch.autograd.Function):
         # [bs, seqlen, out_features] @ [out_features, in_features // TP] -> [bs, seqlen, in_features // TP]
         dx = dout @ weight
 
-        db = dout_flat.sum(dim=0)
+        db = dout_flat.sum(dim=0) if ctx.has_bias else None
         return dx, dw, db
 
 
@@ -247,7 +307,7 @@ class MLA(nn.Module):
         super().__init__()
         self.dim = args.dim
         self.n_heads = args.n_heads
-        self.n_local_heads = args.n_heads  # matters when world_size > 1
+        self.n_local_heads = args.n_heads // world_size  # matters when world_size > 1
         self.q_lora_rank = args.q_lora_rank
         self.kv_lora_rank = args.kv_lora_rank
         self.qk_nope_head_dim = args.qk_nope_head_dim
@@ -272,7 +332,9 @@ class MLA(nn.Module):
             self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim)
         )
 
-        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+        self.wo = RowParallelLinear(
+            self.n_heads * self.v_head_dim, self.dim, dtype=torch.float32
+        )
 
         self.softmax_scale = (self.qk_head_dim) ** (-0.5)
 
@@ -313,6 +375,7 @@ class MLA(nn.Module):
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
 
+        # ColumnParallelLinear would return a sharded view, hence n_local_heads
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -334,16 +397,27 @@ class MLA(nn.Module):
         self.k_cache[:bsz, start_pos:end_pos] = k
         self.v_cache[:bsz, start_pos:end_pos] = v
 
+        # cast QK to FP32
         scores = (
-            torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos])
+            torch.einsum(
+                "bshd,bthd->bsht", q.float(), self.k_cache[:bsz, :end_pos].float()
+            )
             * self.softmax_scale
         )
 
         if mask is not None:
             scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-        x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
+        scores = scores.softmax(dim=-1, dtype=torch.float32)
+        # cast v to FP32
+        x = torch.einsum(
+            "bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos].float()
+        )
+        # if TP > 1:
+        #   x.shape: [bs, seqlen, n_local_heads, v_head_dim]
+        #   wo.shape: [(n_heads * v_head_dim) // TP, dim].T @ [bs, seqlen, n_local_heads * v_head_dim]
+        # we will do all_reduce along the TP dimension, so we would have the global view
         x = self.wo(x.flatten(2))
+        # if TP > 1: x.shape: [bs, seqlen, dim]
         return x
 
 
@@ -386,6 +460,12 @@ class Gate(nn.Module):
             else None
         )
 
+        # init
+        nn.init.kaiming_uniform_(self.weight, math.sqrt(5))
+        if self.bias is not None:
+            bound = 1 / math.sqrt(self.dim)
+            nn.init.uniform_(self.bias, -bound, bound)
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Outputs weights and indices.
@@ -425,15 +505,15 @@ class MoE(nn.Module):
         super().__init__()
         self.dim = args.dim
         self.n_routed_experts = args.n_routed_experts
-        self.n_local_experts = args.n_routed_experts
+        self.n_local_experts = args.n_routed_experts // world_size
         self.n_activated_experts = args.n_activated_experts
         self.experts_start_idx = rank * self.n_local_experts
-        self.expertss_end_idx = self.experts_start_idx + self.n_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(args)
 
         l: list[torch.Tensor] = []
         for i in range(self.n_routed_experts):
-            if self.experts_start_idx <= i < self.expertss_end_idx:
+            if self.experts_start_idx <= i < self.experts_end_idx:
                 l.append(Expert(args.dim, args.moe_inter_dim))
         self.experts = nn.ModuleList(l)
         self.shared_expert = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
@@ -445,12 +525,18 @@ class MoE(nn.Module):
         weights, indices = self.gate(x)
         y = torch.zeros_like(x)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts)
-        for idx in range(self.experts_start_idx, self.expertss_end_idx):
-            if counts[idx] == 0:
+
+        # iterate over global ids that are local to this rank
+        for global_idx in range(self.experts_start_idx, self.experts_end_idx):
+            if counts[global_idx] == 0:
                 continue
-            expert = self.experts[idx]
-            idx, top = torch.where(indices == idx)
-            y[idx] += expert(x[idx]) * weights[idx, top, None]
+            # find token, topk routed to this global expert id
+            token_idx, top = torch.where(indices == global_idx)
+
+            # compute local expert output just for these tokens
+            local_expert_idx = global_idx - self.experts_start_idx
+            expert = self.experts[local_expert_idx]
+            y[token_idx] += expert(x[token_idx]) * weights[token_idx, top, None]
         z = self.shared_expert(x)
         if world_size > 1:
             dist.all_reduce(y)
@@ -461,6 +547,7 @@ def test_moe():
     args = ModelArgs()
     device = "cuda"
     moe = MoE(args).to(device)
+    # [4, 512, 2048]
     x = torch.rand(4, 512, args.dim, device=device)
     out = moe(x)
     print(f"out.shape: {out.shape}")
@@ -479,8 +566,18 @@ def test_gate():
 def test_attention():
     args = ModelArgs()
     device = "cuda"
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
     attention = MLA(args).to(device)
-    x = torch.rand(8, 512, args.dim, device=device, dtype=torch.bfloat16)
+
+    torch.manual_seed(123)
+    torch.cuda.manual_seed_all(123)
+
+    x = torch.rand(
+        8, 512, args.dim, device=device, dtype=torch.bfloat16, requires_grad=True
+    )
+
     freqs_cis = precompute_freqs_cis(args)
     start_pos = 0
     seqlen = x.size(1)
@@ -488,11 +585,17 @@ def test_attention():
     freqs_cis = freqs_cis[start_pos : start_pos + seqlen].to(device)
     mask = torch.full((seqlen, seqlen), float("-inf"), device=x.device).triu_(1)
     out = attention(x, start_pos, freqs_cis, mask).to(device)
-    print(out.shape)
+    # print(f"test_attention | out.shape: {out.shape}")
+
+    loss = out.sum()
+    loss.backward()
+    print(f"test_attention | x.grad.shape: {x.grad.shape}")
+    print(f"test_attention | x.grad.sum: {x.grad.sum().item():.6f}")
 
 
-# test_moe()
-# test_gate()
-# test_attention()
+test_moe()
+test_gate()
+test_attention()
 
-dist.destroy_process_group()
+if dist.is_initialized():
+    dist.destroy_process_group()
