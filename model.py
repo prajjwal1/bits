@@ -120,6 +120,28 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return y.to(dtype)
 
 
+class ParallelEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, dim: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.part_vocab_size = vocab_size // world_size
+        self.vocab_start_idx = rank * self.part_vocab_size
+        self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
+        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if world_size > 1:
+            mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
+            x = x - self.vocab_start_idx
+            x[mask] = 0
+        y = F.embedding(x, self.weight)
+        if world_size > 1:
+            y[mask] = 0
+            dist.all_reduce(y)
+        return y
+
+
 def linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -421,6 +443,17 @@ class MLA(nn.Module):
         return x
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def forward(self, x: torch.Tensor):
+        return F.rms_norm(x, (self.dim,), self.weight, self.eps)
+
+
 def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     dim = args.qk_rope_head_dim
     seqlen = args.max_seq_len
@@ -541,6 +574,27 @@ class MoE(nn.Module):
         if world_size > 1:
             dist.all_reduce(y)
         return (y + z).view(shape)
+
+
+class Block(nn.Module):
+    def __init__(self, layer_id: int, args: ModelArgs):
+        super().__init__()
+        self.attn = MLA(args)
+        self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
+        self.attn_norm = RMSNorm(args.dim)
+        self.ffn_norm = RMSNorm(args.norm)
+
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
+
+class Transformer(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.max_seq_len = args.max_seq_len
+        self.embed = Parallel
 
 
 def test_moe():
