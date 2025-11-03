@@ -354,9 +354,7 @@ class MLA(nn.Module):
             self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim)
         )
 
-        self.wo = RowParallelLinear(
-            self.n_heads * self.v_head_dim, self.dim, dtype=torch.float32
-        )
+        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
 
         self.softmax_scale = (self.qk_head_dim) ** (-0.5)
 
@@ -438,7 +436,7 @@ class MLA(nn.Module):
         #   x.shape: [bs, seqlen, n_local_heads, v_head_dim]
         #   wo.shape: [(n_heads * v_head_dim) // TP, dim].T @ [bs, seqlen, n_local_heads * v_head_dim]
         # we will do all_reduce along the TP dimension, so we would have the global view
-        x = self.wo(x.flatten(2))
+        x = self.wo(x.flatten(2).to(torch.get_default_dtype()))
         # if TP > 1: x.shape: [bs, seqlen, dim]
         return x
 
@@ -449,7 +447,7 @@ class RMSNorm(nn.Module):
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-    
+
     def forward(self, x: torch.Tensor):
         return F.rms_norm(x, (self.dim,), self.weight, self.eps)
 
@@ -580,11 +578,21 @@ class Block(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         self.attn = MLA(args)
-        self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
+        self.ffn = (
+            MLP(args.dim, args.inter_dim)
+            if layer_id < args.n_dense_layers
+            else MoE(args)
+        )
         self.attn_norm = RMSNorm(args.dim)
-        self.ffn_norm = RMSNorm(args.norm)
+        self.ffn_norm = RMSNorm(args.dim)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
         x = x + self.ffn(self.ffn_norm(x))
         return x
@@ -594,7 +602,37 @@ class Transformer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.max_seq_len = args.max_seq_len
-        self.embed = Parallel
+        self.embed = ParallelEmbedding(args.vocab_size, args.dim)
+        self.layers = nn.ModuleList()
+        for layer_id in range(args.n_layers):
+            self.layers.append(Block(layer_id, args))
+        self.norm = RMSNorm(args.dim)
+        self.head = ColumnParallelLinear(
+            args.dim, args.vocab_size, dtype=torch.get_default_dtype()
+        )
+        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
+        seqlen = tokens.size(1)
+        h = self.embed(tokens)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        mask = None
+        if seqlen > 1:
+            mask = torch.full(
+                (seqlen, seqlen), float("-inf"), device=tokens.device
+            ).triu_(1)
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        # since we are doing inference, we get the h for last token
+        # [TODO] add support for training
+        h = self.norm(h)[:, -1]
+        logits = self.head(h)
+        # we are using column parallel for final MLP, so need to do all_gather to get global logits
+        if world_size > 1:
+            all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+            dist.all_gather(all_logits, logits)
+            logits = torch.cat(all_logits, dim=-1)
+        return logits
 
 
 def test_moe():
@@ -647,9 +685,22 @@ def test_attention():
     print(f"test_attention | x.grad.sum: {x.grad.sum().item():.6f}")
 
 
-test_moe()
-test_gate()
-test_attention()
+def test_transformer():
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device("cuda")
+    args = ModelArgs()
+    x = torch.randint(0, args.vocab_size, (2, 128))
+    model = Transformer(args)
+    out = model(x)
+    print(f"out.size: {out.size()} | out.mean(): {out.mean()}")
+    # TP=1 out.size: torch.Size([2, 102400]) | out.mean(): -0.00150299072265625
+    # TP=8 out.size: torch.Size([2, 102400]) | out.mean(): -0.00054168701171875
+
+
+# test_moe()
+# test_gate()
+# test_attention()
+test_transformer()
 
 if dist.is_initialized():
     dist.destroy_process_group()
