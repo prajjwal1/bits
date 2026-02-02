@@ -416,7 +416,7 @@ class MLA(nn.Module):
         #   x.shape: [bs, seqlen, n_local_heads, v_head_dim]
         #   wo.shape: [(n_heads * v_head_dim) // TP, dim].T @ [bs, seqlen, n_local_heads * v_head_dim]
         # we will do all_reduce along the TP dimension, so we would have the global view
-        x = self.wo(x.flatten(2))
+        x = self.wo(x.flatten(2).to(self.wo.weight.dtype))
         # if TP > 1: x.shape: [bs, seqlen, dim]
         return x
 
@@ -569,7 +569,7 @@ def test_attention():
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
 
-    attention = MLA(args).to(device)
+    attention = MLA(args).to(device, dtype=torch.bfloat16)
 
     torch.manual_seed(123)
     torch.cuda.manual_seed_all(123)
